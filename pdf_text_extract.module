@@ -1,0 +1,535 @@
+<?php
+/**
+ * @file
+ * Extracts the text of PDF files into a long text field, using Ghostscript.
+ */
+
+/**
+ * Most bytes of Ghostscript output read before the process is stopped.
+ */
+const PDF_TEXT_EXTRACT_MAX_OUTPUT = 16777216;
+
+/**
+ * Oldest Ghostscript version without published -dSAFER bypasses.
+ *
+ * Ghostscript reads untrusted uploads, and versions before this one have
+ * published vulnerabilities letting a crafted PDF escape -dSAFER (fixed in
+ * 10.01.2, 10.03.1 and 10.04.0). Older versions get a status report warning.
+ */
+const PDF_TEXT_EXTRACT_SAFE_GHOSTSCRIPT = '10.04.0';
+
+/**
+ * Implements hook_config_info().
+ */
+function pdf_text_extract_config_info(): array {
+  $prefixes['pdf_text_extract.settings'] = array(
+    'label' => t('PDF Text Extract settings'),
+    'group' => t('Configuration'),
+  );
+  return $prefixes;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function pdf_text_extract_menu(): array {
+  $items['admin/config/media/pdf-text-extract'] = array(
+    'title' => 'PDF text extraction',
+    'description' => 'Where Ghostscript is, and how long an extraction may take.',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => array('pdf_text_extract_settings_form'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'pdf_text_extract.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Returns the Ghostscript command to run.
+ *
+ * @return string
+ *   The configured path, or the usual command name for this platform when
+ *   none is configured.
+ */
+function pdf_text_extract_ghostscript(): string {
+  $path = (string) config_get('pdf_text_extract.settings', 'ghostscript_path');
+  if ($path !== '') {
+    return $path;
+  }
+  return strncasecmp(PHP_OS, 'WIN', 3) === 0 ? 'gswin64c' : 'gs';
+}
+
+/**
+ * Runs Ghostscript with the given arguments, without a shell.
+ *
+ * Output goes to temporary files, not pipes: on Windows PHP can neither
+ * select on nor unblock process pipes, and reading one pipe while the other
+ * fills deadlocks both processes (seen in testing: no timeout could fire).
+ *
+ * @param array $args
+ *   Arguments after the command. Passed to the process as a list, so no
+ *   escaping is needed and none of them can be read as shell syntax.
+ * @param int $timeout
+ *   Seconds after which the process is killed.
+ *
+ * @return array
+ *   An array with 'stdout', 'stderr', 'exit' (NULL when it could not be
+ *   started) and 'timed_out'.
+ */
+function pdf_text_extract_run_ghostscript(array $args, int $timeout): array {
+  $result = array('stdout' => '', 'stderr' => '', 'exit' => NULL, 'timed_out' => FALSE);
+  $out = backdrop_realpath(backdrop_tempnam('temporary://', 'pte'));
+  $err = backdrop_realpath(backdrop_tempnam('temporary://', 'pte'));
+  if (!$out || !$err) {
+    return $result;
+  }
+  $command = array_merge(array(pdf_text_extract_ghostscript()), $args);
+  $spec = array(1 => array('file', $out, 'w'), 2 => array('file', $err, 'w'));
+  $process = @proc_open($command, $spec, $pipes, NULL, NULL, array('bypass_shell' => TRUE));
+  if (is_resource($process)) {
+    $deadline = microtime(TRUE) + $timeout;
+    while (($status = proc_get_status($process)) && $status['running']) {
+      clearstatcache(TRUE, $out);
+      // A runaway PDF must not fill the disk or memory: stop like a timeout.
+      if (microtime(TRUE) > $deadline || filesize($out) > PDF_TEXT_EXTRACT_MAX_OUTPUT) {
+        $result['timed_out'] = TRUE;
+        proc_terminate($process);
+        break;
+      }
+      usleep(50000);
+    }
+    $exit = proc_close($process);
+    // proc_close() returns -1 once proc_get_status() has seen the exit, so
+    // take the code from the last status where there is one.
+    if ($result['timed_out']) {
+      $result['exit'] = -1;
+    }
+    else {
+      $result['exit'] = (isset($status['exitcode']) && $status['exitcode'] !== -1) ? $status['exitcode'] : $exit;
+      $result['stdout'] = (string) file_get_contents($out);
+      $result['stderr'] = (string) file_get_contents($err);
+    }
+  }
+  @unlink($out);
+  @unlink($err);
+  return $result;
+}
+
+/**
+ * Returns the installed Ghostscript version.
+ *
+ * @return string|null
+ *   The version string, or NULL when Ghostscript cannot be run.
+ */
+function pdf_text_extract_ghostscript_version(): ?string {
+  $run = pdf_text_extract_run_ghostscript(array('--version'), 10);
+  if ($run['exit'] !== 0) {
+    return NULL;
+  }
+  $version = trim($run['stdout']);
+  return $version === '' ? NULL : $version;
+}
+
+/**
+ * Extracts the text of a PDF file.
+ *
+ * Only the PDF's own text layer is read: a scanned PDF with no text layer
+ * gives an empty string (that would need OCR).
+ *
+ * @param object $file
+ *   A file entity.
+ *
+ * @return string|false
+ *   The text, tidied, or FALSE when the file is not a readable PDF or
+ *   Ghostscript failed. Failures are logged.
+ */
+function pdf_text_extract_file($file) {
+  if (empty($file->uri) || empty($file->filemime) || $file->filemime !== 'application/pdf') {
+    return FALSE;
+  }
+  $path = backdrop_realpath($file->uri);
+  if (!$path || !is_readable($path)) {
+    watchdog('pdf_text_extract', 'Cannot read %uri.', array('%uri' => $file->uri), WATCHDOG_ERROR);
+    return FALSE;
+  }
+  $timeout = (int) config_get('pdf_text_extract.settings', 'timeout') ?: 60;
+  $run = pdf_text_extract_run_ghostscript(array(
+    '-q', '-dNOPAUSE', '-dBATCH', '-dSAFER', '-sDEVICE=txtwrite', '-o', '-', $path,
+  ), $timeout);
+  if ($run['exit'] !== 0) {
+    watchdog('pdf_text_extract', 'Ghostscript could not extract the text of %uri (@reason): @stderr', array(
+      '%uri' => $file->uri,
+      '@reason' => $run['exit'] === NULL ? t('not found') : ($run['timed_out'] ? t('timed out') : t('exit code @code', array('@code' => $run['exit']))),
+      '@stderr' => truncate_utf8(trim($run['stderr']), 500, FALSE, TRUE),
+    ), WATCHDOG_ERROR);
+    return FALSE;
+  }
+  return pdf_text_extract_tidy($run['stdout']);
+}
+
+/**
+ * Tidies Ghostscript's text output for storage.
+ *
+ * txtwrite lays text out with runs of spaces to keep its position on the
+ * page; for search only the words matter.
+ *
+ * @param string $text
+ *   Raw txtwrite output.
+ *
+ * @return string
+ *   Valid UTF-8, one space between words, at most one blank line in a row.
+ */
+function pdf_text_extract_tidy(string $text): string {
+  if (!backdrop_validate_utf8($text)) {
+    $text = backdrop_convert_to_utf8($text, 'Windows-1252') ?: '';
+  }
+  $text = str_replace(array("\r\n", "\r", "\f"), "\n", $text);
+  // Control characters other than newline and tab.
+  $text = preg_replace('/[\x00-\x08\x0B-\x1F\x7F]/u', '', $text);
+  $text = preg_replace('/[ \t]+/u', ' ', $text);
+  $text = preg_replace('/ *\n */u', "\n", $text);
+  $text = preg_replace('/\n{3,}/u', "\n\n", $text);
+  return trim($text);
+}
+
+/**
+ * Returns this module's settings for a file field instance.
+ *
+ * @param array $instance
+ *   A field instance.
+ *
+ * @return array|null
+ *   The settings, with defaults filled in, or NULL when no text field is
+ *   chosen for this instance.
+ */
+function pdf_text_extract_instance_settings(array $instance): ?array {
+  $settings = $instance['settings']['pdf_text_extract'] ?? array();
+  if (empty($settings['text_field'])) {
+    return NULL;
+  }
+  return $settings + array('on_save' => FALSE, 'overwrite' => FALSE);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for field_ui_field_edit_form.
+ */
+function pdf_text_extract_form_field_ui_field_edit_form_alter(&$form, &$form_state, $form_id) {
+  $instance = $form['#instance'];
+  $field = field_info_field($instance['field_name']);
+  if ($field['type'] !== 'file') {
+    return;
+  }
+  $settings = ($instance['settings']['pdf_text_extract'] ?? array()) + array(
+    'text_field' => '',
+    'on_save' => FALSE,
+    'overwrite' => FALSE,
+  );
+
+  $options = array();
+  foreach (field_info_instances($instance['entity_type'], $instance['bundle']) as $other) {
+    $other_field = field_info_field($other['field_name']);
+    if (in_array($other_field['type'], array('text_long', 'text_with_summary'), TRUE)) {
+      $options[$other['field_name']] = $other['label'] . ' (' . $other['field_name'] . ')';
+    }
+  }
+
+  $form['instance']['settings']['pdf_text_extract'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('PDF text extraction'),
+    '#description' => t('Copies the text of PDF files uploaded to this field into a long text field, so that site search finds what is inside them. Only text the PDF already contains is read: a scanned PDF with no text layer gives nothing.'),
+  );
+  $form['instance']['settings']['pdf_text_extract']['text_field'] = array(
+    '#type' => 'select',
+    '#title' => t('Text field'),
+    '#description' => $options
+      ? t('Where the text goes. Editing forms show an "Extract text from PDF" button under this field.')
+      : t('Add a "Long text" field to this bundle first.'),
+    '#options' => $options,
+    '#default_value' => $settings['text_field'],
+    '#empty_option' => '- ' . t('Disabled') . ' -',
+  );
+  $enabled = array(
+    'invisible' => array(
+      ':input[name="instance[settings][pdf_text_extract][text_field]"]' => array('value' => ''),
+    ),
+  );
+  $form['instance']['settings']['pdf_text_extract']['on_save'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Also extract automatically when the content is saved'),
+    '#description' => t('Runs when a PDF is added or replaced, or when the text field is empty.'),
+    '#default_value' => $settings['on_save'],
+    '#states' => $enabled,
+  );
+  $form['instance']['settings']['pdf_text_extract']['overwrite'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Replace text already in the text field when the PDF changes'),
+    '#description' => t('Leave unticked to keep text an editor has typed or corrected. The button always replaces it.'),
+    '#default_value' => $settings['overwrite'],
+    // Hidden when no text field is chosen OR automatic extraction is off: a
+    // list of conditions is an OR in states.js (verifyConstraints()).
+    '#states' => array(
+      'invisible' => array(
+        $enabled['invisible'],
+        array(':input[name="instance[settings][pdf_text_extract][on_save]"]' => array('checked' => FALSE)),
+      ),
+    ),
+  );
+}
+
+/**
+ * Returns the PDF files held in a file field of an entity.
+ *
+ * @param string $entity_type
+ *   The entity type.
+ * @param object $entity
+ *   The entity.
+ * @param string $field_name
+ *   The file field.
+ *
+ * @return array
+ *   File entities keyed by fid, PDFs only.
+ */
+function pdf_text_extract_entity_pdfs(string $entity_type, $entity, string $field_name): array {
+  $fids = array();
+  foreach (field_get_items($entity_type, $entity, $field_name) ?: array() as $item) {
+    if (!empty($item['fid'])) {
+      $fids[] = $item['fid'];
+    }
+  }
+  return array_filter(file_load_multiple($fids), function ($file) {
+    return $file->filemime === 'application/pdf';
+  });
+}
+
+/**
+ * Extracts and joins the text of several PDF files.
+ *
+ * @param array $files
+ *   File entities.
+ *
+ * @return string|false
+ *   The text of each file, separated by a blank line, or FALSE when any
+ *   extraction failed.
+ */
+function pdf_text_extract_files(array $files) {
+  $texts = array();
+  foreach ($files as $file) {
+    $text = pdf_text_extract_file($file);
+    if ($text === FALSE) {
+      return FALSE;
+    }
+    if ($text !== '') {
+      $texts[] = $text;
+    }
+  }
+  return implode("\n\n", $texts);
+}
+
+/**
+ * Writes text into an entity's long text field, in the plain text format.
+ *
+ * The text comes from an uploaded file, so it is stored as plain text and
+ * never as HTML.
+ *
+ * @param string $entity_type
+ *   The entity type.
+ * @param object $entity
+ *   The entity, changed in place.
+ * @param string $field_name
+ *   The long text field.
+ * @param string $text
+ *   The text.
+ */
+function pdf_text_extract_set_text(string $entity_type, $entity, string $field_name, string $text): void {
+  // field_language() caches per entity id, which is empty for every unsaved
+  // entity, so a new entity could get another bundle's answer.
+  list($id) = entity_extract_ids($entity_type, $entity);
+  if (empty($id)) {
+    backdrop_static_reset('field_language');
+  }
+  $langcode = field_language($entity_type, $entity, $field_name);
+  $entity->{$field_name}[$langcode] = $text === '' ? array() : array(array(
+    'value' => $text,
+    'summary' => '',
+    'format' => pdf_text_extract_format(),
+  ));
+}
+
+/**
+ * Returns the text format extracted text is stored in.
+ *
+ * @return string
+ *   'plain_text' when it exists, otherwise the site's fallback format.
+ */
+function pdf_text_extract_format(): string {
+  return filter_format_load('plain_text') ? 'plain_text' : filter_fallback_format();
+}
+
+/**
+ * Implements hook_entity_presave().
+ *
+ * Extracts automatically where an instance asks for it: when a PDF has been
+ * added or replaced, or when the text field is still empty.
+ */
+function pdf_text_extract_entity_presave($entity, $type) {
+  list($id, , $bundle) = entity_extract_ids($type, $entity);
+  foreach (field_info_instances($type, $bundle) as $instance) {
+    $settings = pdf_text_extract_instance_settings($instance);
+    if (!$settings || !$settings['on_save']) {
+      continue;
+    }
+    $field_name = $instance['field_name'];
+    $target = $settings['text_field'];
+    if (!field_info_instance($type, $target, $bundle)) {
+      continue;
+    }
+    $files = pdf_text_extract_entity_pdfs($type, $entity, $field_name);
+    $original = !empty($entity->original) ? array_keys(pdf_text_extract_entity_pdfs($type, $entity->original, $field_name)) : array();
+    $changed = array_keys($files) != $original;
+    $existing = field_get_items($type, $entity, $target);
+    $empty = empty($existing[0]['value']);
+
+    $replace = $changed && $settings['overwrite'];
+    if (!$files) {
+      // The PDF was removed: clear the text too, if allowed to replace it.
+      if ($replace && !$empty) {
+        pdf_text_extract_set_text($type, $entity, $target, '');
+      }
+      continue;
+    }
+    if (!$empty && !$replace) {
+      continue;
+    }
+    $text = pdf_text_extract_files($files);
+    if ($text !== FALSE) {
+      pdf_text_extract_set_text($type, $entity, $target, $text);
+    }
+  }
+}
+
+/**
+ * Implements hook_field_attach_form().
+ *
+ * Adds the "Extract text from PDF" button under each file field that has a
+ * text field chosen.
+ */
+function pdf_text_extract_field_attach_form($entity_type, $entity, &$form, &$form_state, $langcode) {
+  list(, , $bundle) = entity_extract_ids($entity_type, $entity);
+  foreach (field_info_instances($entity_type, $bundle) as $instance) {
+    $settings = pdf_text_extract_instance_settings($instance);
+    $field_name = $instance['field_name'];
+    $target = $settings['text_field'] ?? NULL;
+    if (!$target || !isset($form[$field_name]) || !isset($form[$target])) {
+      continue;
+    }
+    $wrapper = backdrop_html_id('pdf-text-extract-' . $target);
+    $form[$target]['#prefix'] = ($form[$target]['#prefix'] ?? '') . '<div id="' . $wrapper . '">';
+    $form[$target]['#suffix'] = '</div>' . ($form[$target]['#suffix'] ?? '');
+
+    $form[$field_name]['pdf_text_extract'] = array(
+      '#type' => 'submit',
+      '#value' => t('Extract text from PDF'),
+      '#name' => 'pdf_text_extract_' . $field_name,
+      '#submit' => array('pdf_text_extract_button_submit'),
+      '#limit_validation_errors' => array(array($field_name)),
+      '#ajax' => array(
+        'callback' => 'pdf_text_extract_button_ajax',
+        'wrapper' => $wrapper,
+      ),
+      '#weight' => 100,
+      '#pdf_text_extract' => array(
+        'entity_type' => $entity_type,
+        'field_name' => $field_name,
+        'target' => $target,
+      ),
+    );
+  }
+}
+
+/**
+ * Submit handler for the "Extract text from PDF" button.
+ *
+ * Puts the text into the text field's submitted input and rebuilds the
+ * form, so the editor sees it, can correct it, and saves it with the rest.
+ */
+function pdf_text_extract_button_submit($form, &$form_state) {
+  $info = $form_state['triggering_element']['#pdf_text_extract'];
+  $field_name = $info['field_name'];
+  $target = $info['target'];
+  $form_state['rebuild'] = TRUE;
+
+  $langcode = $form[$field_name]['#language'] ?? LANGUAGE_NONE;
+  $fids = array();
+  foreach ($form_state['values'][$field_name][$langcode] ?? array() as $item) {
+    if (is_array($item) && !empty($item['fid'])) {
+      $fids[] = (int) $item['fid'];
+    }
+  }
+  $files = pdf_text_extract_allowed_files($info['entity_type'], $form_state, $field_name, $fids);
+  if (!$files) {
+    backdrop_set_message(t('There is no PDF in this field to read. Upload one first.'), 'warning');
+    return;
+  }
+  $text = pdf_text_extract_files($files);
+  if ($text === FALSE) {
+    backdrop_set_message(t('The text could not be read from the PDF. Details are in the site log.'), 'error');
+    return;
+  }
+  if ($text === '') {
+    backdrop_set_message(t('The PDF contains no text. A scanned document needs OCR first.'), 'warning');
+  }
+  else {
+    backdrop_set_message(t('Text extracted: @count characters. Check it, then save.', array('@count' => backdrop_strlen($text))));
+  }
+
+  // On rebuild the textarea shows the submitted input, so that is what is
+  // replaced. The format is set too, so the text is saved as plain text.
+  $target_langcode = $form[$target]['#language'] ?? LANGUAGE_NONE;
+  $form_state['input'][$target][$target_langcode][0]['value'] = $text;
+  $form_state['input'][$target][$target_langcode][0]['format'] = pdf_text_extract_format();
+}
+
+/**
+ * Returns the files the button may read.
+ *
+ * Only PDFs the entity already holds in this field, or temporary uploads by
+ * the current user, so a forged fid cannot read somebody else's file.
+ *
+ * @param string $entity_type
+ *   The entity type.
+ * @param array $form_state
+ *   The form state.
+ * @param string $field_name
+ *   The file field.
+ * @param array $fids
+ *   The submitted file ids.
+ *
+ * @return array
+ *   File entities keyed by fid.
+ */
+function pdf_text_extract_allowed_files(string $entity_type, array $form_state, string $field_name, array $fids): array {
+  global $user;
+  $entity = $form_state[$entity_type] ?? ($form_state['build_info']['args'][0] ?? NULL);
+  $held = is_object($entity) ? array_keys(pdf_text_extract_entity_pdfs($entity_type, $entity, $field_name)) : array();
+  $allowed = array();
+  foreach (file_load_multiple($fids) as $fid => $file) {
+    $own_upload = (int) $file->status !== FILE_STATUS_PERMANENT && (int) $file->uid === (int) $user->uid;
+    if ($file->filemime === 'application/pdf' && (in_array($fid, $held) || $own_upload)) {
+      $allowed[$fid] = $file;
+    }
+  }
+  return $allowed;
+}
+
+/**
+ * AJAX callback for the "Extract text from PDF" button.
+ *
+ * @return array
+ *   The text field, with the messages above it.
+ */
+function pdf_text_extract_button_ajax($form, $form_state) {
+  $target = $form_state['triggering_element']['#pdf_text_extract']['target'];
+  $element = $form[$target];
+  $element['#prefix'] = ($element['#prefix'] ?? '') . theme('status_messages');
+  return $element;
+}

@@ -1,0 +1,34 @@
+<?php
+/**
+ * @file
+ * Install, update and uninstall functions for PDF Text Extract.
+ */
+
+/**
+ * Implements hook_requirements().
+ */
+function pdf_text_extract_requirements($phase) {
+  $requirements = array();
+  if ($phase !== 'runtime') {
+    return $requirements;
+  }
+  $t = get_t();
+  $version = pdf_text_extract_ghostscript_version();
+  $requirements['pdf_text_extract'] = array(
+    'title' => $t('PDF Text Extract: Ghostscript'),
+    'value' => $version ?: $t('Not found'),
+    'severity' => $version ? REQUIREMENT_OK : REQUIREMENT_ERROR,
+  );
+  if (!$version) {
+    $requirements['pdf_text_extract']['description'] = $t('Text cannot be extracted from PDFs. Install Ghostscript, or set its path on the <a href="@url">settings page</a>.', array(
+      '@url' => url('admin/config/media/pdf-text-extract'),
+    ));
+  }
+  elseif (version_compare($version, PDF_TEXT_EXTRACT_SAFE_GHOSTSCRIPT, '<')) {
+    $requirements['pdf_text_extract']['severity'] = REQUIREMENT_WARNING;
+    $requirements['pdf_text_extract']['description'] = $t('Ghostscript before @safe has published security vulnerabilities that let a crafted PDF run commands on the server. Uploaded PDFs are read with it, so ask your host to upgrade.', array(
+      '@safe' => PDF_TEXT_EXTRACT_SAFE_GHOSTSCRIPT,
+    ));
+  }
+  return $requirements;
+}

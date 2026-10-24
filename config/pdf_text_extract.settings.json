@@ -1,0 +1,5 @@
+{
+    "_config_name": "pdf_text_extract.settings",
+    "ghostscript_path": "",
+    "timeout": 60
+}

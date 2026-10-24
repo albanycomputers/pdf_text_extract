@@ -1,0 +1,8 @@
+name = PDF Text Extract
+description = Extracts the text of PDF files uploaded to a file field into a long text field, so site search can find what is inside them.
+backdrop = 1.x
+type = module
+package = Media
+dependencies[] = file
+dependencies[] = text
+configure = admin/config/media/pdf-text-extract
